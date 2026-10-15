@@ -71,6 +71,20 @@ impl Options<'_> {
     }
 }
 
+/// What a folder's listing says an entry is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Folder,
+    /// A link, or an entry whose kind the listing did not say.
+    Other,
+}
+
+/// What [`files_in_noting`] hands over for each folder it lists: the folder, the name and kind
+/// of every entry in it (hidden ones too), and whether that is all of them (not when the walk
+/// stopped inside the folder, or an entry could not be read).
+pub type NoteFolder<'a> = &'a mut dyn FnMut(&Path, Vec<(std::ffi::OsString, EntryKind)>, bool);
+
 /// The files below folder `root` that `keep` accepts. Hidden entries (names starting with `.`)
 /// are left out, the folder `skip` (e.g. the library's own) is never entered, and the walk stops
 /// at `limits` (see [`Walked::truncated`]). Unreadable folders are skipped.
@@ -78,10 +92,40 @@ pub fn files_in(root: &Path, skip: Option<&Path>, limits: Limits, keep: impl FnM
     files_in_with(root, skip, limits, Options::default(), keep)
 }
 
+/// [`files_in`], handing the listing of every folder it reads to `note`: who walks a folder to
+/// find its files has, with that, the answer to "is this name there" for everything in it, and
+/// need not ask the disk again (a round trip for each name on a network share).
+pub fn files_in_noting(root: &Path, skip: Option<&Path>, limits: Limits, keep: impl FnMut(&Path) -> bool, note: NoteFolder) -> Walked {
+    files_in_with_noting(root, skip, limits, Options::default(), keep, note)
+}
+
 /// [`files_in`] with optional direct-folder scope, cancellation and shared directory identities.
 /// Cancellation is checked before filesystem work, during listing and between queued entries;
 /// it does not report a limit truncation. Call only on a filesystem worker.
-pub fn files_in_with(root: &Path, skip: Option<&Path>, limits: Limits, mut options: Options<'_>, mut keep: impl FnMut(&Path) -> bool) -> Walked {
+pub fn files_in_with(root: &Path, skip: Option<&Path>, limits: Limits, options: Options<'_>, keep: impl FnMut(&Path) -> bool) -> Walked {
+    walk(root, skip, limits, options, keep, None)
+}
+
+/// [`files_in_with`], also handing over each folder's listing without another walk.
+pub(crate) fn files_in_with_noting(
+    root: &Path,
+    skip: Option<&Path>,
+    limits: Limits,
+    options: Options<'_>,
+    keep: impl FnMut(&Path) -> bool,
+    note: NoteFolder,
+) -> Walked {
+    walk(root, skip, limits, options, keep, Some(note))
+}
+
+fn walk(
+    root: &Path,
+    skip: Option<&Path>,
+    limits: Limits,
+    mut options: Options<'_>,
+    mut keep: impl FnMut(&Path) -> bool,
+    mut note: Option<NoteFolder>,
+) -> Walked {
     let mut out = Walked::default();
     if options.cancelled() {
         return out;
@@ -132,21 +176,45 @@ pub fn files_in_with(root: &Path, skip: Option<&Path>, limits: Limits, mut optio
             seen.insert(c.clone());
         }
         let mut children = Vec::new();
+        // A partial or cancelled listing must not answer that an unlisted file is missing.
+        let mut listed = note.is_some().then(Vec::new);
+        let mut complete = true;
         for entry in rd {
             if options.cancelled() {
+                complete = false;
                 break;
             }
-            let Ok(e) = entry else { continue };
+            let Ok(e) = entry else {
+                complete = false;
+                continue;
+            };
             if out.entries >= limits.max_entries {
                 out.truncated = true;
+                complete = false;
                 break;
             }
             out.entries = out.entries.saturating_add(1);
             let p = e.path();
-            if hidden(&p) {
+            // (a hidden entry's kind is only asked for when the listing is wanted; every other
+            // entry's is asked once)
+            let is_hidden = hidden(&p);
+            if is_hidden && listed.is_none() {
                 continue;
             }
-            let Ok(ft) = e.file_type() else { continue };
+            let ft = e.file_type();
+            if let Some(listed) = listed.as_mut() {
+                let kind = match &ft {
+                    Ok(t) if t.is_symlink() => EntryKind::Other,
+                    Ok(t) if t.is_dir() => EntryKind::Folder,
+                    Ok(t) if t.is_file() => EntryKind::File,
+                    _ => EntryKind::Other,
+                };
+                listed.push((e.file_name(), kind));
+            }
+            if is_hidden {
+                continue;
+            }
+            let Ok(ft) = ft else { continue };
             let (dir, identity) = if ft.is_symlink() {
                 // A link to a folder needs its target identity; regular entries use file_type.
                 match std::fs::metadata(&p) {
@@ -171,6 +239,9 @@ pub fn files_in_with(root: &Path, skip: Option<&Path>, limits: Limits, mut optio
             };
             children.push((p, dir, identity));
         }
+        if let (Some(note), Some(listed)) = (note.as_mut(), listed) {
+            note(&path, listed, complete && !options.cancelled());
+        }
         children.sort();
         let below = depth.saturating_add(1);
         stack.extend(children.into_iter().rev().map(|(p, d, c)| (p, below, d, c)));
@@ -187,6 +258,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Given a folder with files, a folder inside it, a hidden file and a link, when it is walked
+    /// with its listings noted, then the walk finds what it finds without them, and each folder's
+    /// listing holds every entry by name with its kind (hidden ones too, a link as neither file nor
+    /// folder) and says it is all of them; a walk that stops inside a folder says it is not.
+    #[test]
+    fn a_walk_notes_each_folders_listing() {
+        let root = tmp("noting");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        for name in ["a.jpg", ".hidden", "sub/b.jpg"] {
+            std::fs::write(root.join(name), b"x").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("a.jpg"), root.join("link.jpg")).unwrap();
+        let mut noted: Vec<(PathBuf, Vec<(String, EntryKind)>, bool)> = Vec::new();
+        let walked = files_in_noting(&root, None, Limits::default(), |_| true, &mut |dir, entries, complete| {
+            let mut entries: Vec<(String, EntryKind)> = entries.into_iter().map(|(n, k)| (n.to_string_lossy().to_string(), k)).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            noted.push((dir.to_path_buf(), entries, complete));
+        });
+        assert_eq!(walked, files_in(&root, None, Limits::default(), |_| true), "the same walk, noted or not");
+        let named = |n: &str, k: EntryKind| (n.to_string(), k);
+        let mut top = vec![named(".hidden", EntryKind::File), named("a.jpg", EntryKind::File), named("sub", EntryKind::Folder)];
+        if cfg!(unix) {
+            top.insert(2, named("link.jpg", EntryKind::Other));
+        }
+        assert_eq!(noted, [(root.clone(), top, true), (root.join("sub"), vec![named("b.jpg", EntryKind::File)], true)]);
+
+        // stopped inside the first folder: its listing is not all of it
+        let mut cut = Vec::new();
+        let walked = files_in_noting(&root, None, Limits { max_depth: 8, max_entries: 2 }, |_| true, &mut |dir, entries, complete| {
+            cut.push((dir.to_path_buf(), entries.len(), complete))
+        });
+        assert!(walked.truncated);
+        assert_eq!(cut.first().map(|(dir, n, complete)| (dir.clone(), *n, *complete)), Some((root.clone(), 2, false)));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
