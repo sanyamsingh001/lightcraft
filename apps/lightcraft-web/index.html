@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LightCraft</title>
+  <link rel="icon" href="data:,">
+  <meta name="description" content="LightCraft: open-source photo library and raw developer, running in your browser (WASM).">
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #1c1c1c; }
+    canvas#lightcraft_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+    #lightcraft_loading {
+      position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      color: #b8b8b8; font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; pointer-events: none;
+    }
+    #lightcraft_status { position: absolute; left: 0; bottom: 0; width: 1px; height: 1px; overflow: hidden; }
+    #lightcraft_recovery {
+      position: fixed; inset: 0; z-index: 10; display: flex; align-items: flex-start; justify-content: center; padding: 32px; overflow: auto;
+      background: #1c1c1c; color: #e0e0e0; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    #lightcraft_recovery[hidden] { display: none; }
+    #lightcraft_recovery > div { width: 100%; max-width: 520px; min-width: 0; margin: auto; overflow-wrap: anywhere; }
+    #lightcraft_recovery h1 { font-size: 20px; font-weight: 600; }
+    #lightcraft_recovery button {
+      margin: 4px 8px 4px 0; padding: 8px 12px; border: 1px solid #606060; border-radius: 4px;
+      background: #333; color: #e0e0e0; font: inherit; cursor: pointer;
+    }
+    #lightcraft_recovery button:disabled { opacity: 0.5; cursor: default; }
+  </style>
+</head>
+<body>
+  <canvas id="lightcraft_canvas"></canvas>
+  <div id="lightcraft_loading">Loading LightCraft…</div>
+  <div id="lightcraft_status" aria-live="polite"></div>
+  <section id="lightcraft_recovery" role="alert" aria-labelledby="lightcraft_recovery_title" hidden>
+    <div>
+      <h1 id="lightcraft_recovery_title">Editor stopped drawing</h1>
+      <p id="lightcraft_recovery_message">Export the active photo or back up the library before reloading.</p>
+      <p>Reloading loses unsaved work, including photos kept only for this session. A backup keeps your library and edits; a PNG export keeps the active photo's current appearance.</p>
+      <button id="lightcraft_recovery_export" type="button">Export Active Photo as PNG</button>
+      <button id="lightcraft_recovery_backup" type="button">Back Up Library…</button>
+      <button id="lightcraft_recovery_reload" type="button">Reload</button>
+      <p id="lightcraft_recovery_status" aria-live="polite"></p>
+    </div>
+  </section>
+  <script id="lightcraft_graphics_recovery">
+    // DOM controls survive the loss of the WebGL context that draws the entire editor.
+    (() => {
+      const canvas = document.getElementById("lightcraft_canvas");
+      const recovery = document.getElementById("lightcraft_recovery");
+      const message = document.getElementById("lightcraft_recovery_message");
+      const status = document.getElementById("lightcraft_recovery_status");
+      canvas.addEventListener("webglcontextlost", (event) => {
+        event.preventDefault();
+        // Ignore notices left from before recovery opened. Further loss events must keep
+        // the status of an export or backup already running in this recovery session.
+        if (recovery.hidden) status.textContent = "";
+        recovery.hidden = false;
+        message.textContent = "Export the active photo or back up the library before reloading.";
+      });
+      canvas.addEventListener("webglcontextrestored", () => {
+        // A restored context does not recreate eframe's textures and other GPU resources.
+        // Keep the recovery controls until a reload has rebuilt the editor.
+        if (!recovery.hidden) {
+          message.textContent = "Reload to show the editor again after exporting or backing up.";
+        }
+      });
+      const action = (elementId, commandId, params, success) => {
+        const button = document.getElementById(elementId);
+        button.addEventListener("click", async () => {
+          button.disabled = true;
+          status.textContent = "Working…";
+          try {
+            if (!globalThis.lightcraft?.command) {
+              throw new Error("LightCraft is still starting. Wait a moment and try again.");
+            }
+            const resolvedParams = typeof params === "function" ? await params() : params;
+            await globalThis.lightcraft.command(commandId, JSON.stringify(resolvedParams));
+            status.textContent = success;
+          } catch (error) {
+            status.textContent = String(error);
+          } finally {
+            button.disabled = false;
+          }
+        });
+      };
+      action("lightcraft_recovery_export", "app.export", async () => {
+        const state = JSON.parse(await globalThis.lightcraft.command("library.state", "{}"));
+        const active = state.selection?.active;
+        if (active == null) throw new Error("No active photo to export.");
+        if (!Number.isSafeInteger(active) || active < 0) throw new Error("Active photo ID cannot be exported safely.");
+        return {format: "png", path: "/exports/LightCraft.png", ids: [active]};
+      }, "Export finished. Keep the downloaded PNG.");
+      action("lightcraft_recovery_backup", "file.backupLibrary", {}, "Backup started. Wait for the download to finish before reloading.");
+      document.getElementById("lightcraft_recovery_reload").addEventListener("click", () => {
+        if (confirm("Reload LightCraft? Unsaved work, including photos kept only for this session, will be lost. Export or back up first.")) {
+          location.reload();
+        }
+      });
+    })();
+  </script>
+  <script type="module">
+    import init, { start, command } from "./lightcraft_web.js";
+    (async () => {
+      // Compile once; the render workers (worker.js) instantiate the same compiled module.
+      const module = await WebAssembly.compileStreaming(fetch("./lightcraft_web_bg.wasm"));
+      globalThis.lightcraftModule = module;
+      await init({ module_or_path: module });
+      // automation: `await lightcraft.command("library.info", "{}")` → JSON text
+      globalThis.lightcraft = { command };
+      start();
+    })().catch((e) => {
+      console.error(e);
+      const el = document.getElementById("lightcraft_loading");
+      if (el) el.textContent = "LightCraft failed to load: " + e;
+    });
+  </script>
+</body>
+</html>
